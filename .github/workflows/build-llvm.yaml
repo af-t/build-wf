@@ -12,7 +12,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: llvm/llvm-project
-          ref: release/23.x
+          ref: llvmorg-23.1.2
           fetch-depth: 1
 
       - name: Install cross-compilation dependencies
