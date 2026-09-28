@@ -26,16 +26,24 @@ jobs:
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
             libc6-dev-arm64-cross \
-            libstdc++-12-dev-arm64-cross \
+            libstdc++-13-dev-arm64-cross \
             linux-libc-dev-arm64-cross
 
-      - name: Verify sysroot
+      - name: Build host tools (native x86_64)
         run: |
-          ls -la /usr/aarch64-linux-gnu/lib/
-          ls -la /usr/aarch64-linux-gnu/lib/aarch64-linux-gnu/ 2>/dev/null || true
-          aarch64-linux-gnu-gcc -print-sysroot
+          cmake -G Ninja \
+            -S llvm \
+            -B build-host \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_BUILD_TOOLS=ON \
+            -DLLVM_BUILD_UTILS=ON \
+            -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF
+          cmake --build build-host --target llvm-tblgen llvm-min-tblgen --parallel "$(nproc)"
 
-      - name: Configure (cross-compile to aarch64)
+      - name: Configure cross-compile (arm64)
         run: |
           cmake -G Ninja \
             -S llvm \
@@ -53,7 +61,10 @@ jobs:
             -DLLVM_HOST_TRIPLE=aarch64-linux-gnu \
             -DLLVM_ENABLE_LTO=OFF \
             -DLLVM_ENABLE_STACK_PROTECTOR=ON \
-            -DLLVM_ENABLE_DEAD_CODE_STRIPPING=ON
+            -DLLVM_ENABLE_DEAD_CODE_STRIPPING=ON \
+            -DLLVM_TABLEGEN="$GITHUB_WORKSPACE/build-host/bin/llvm-tblgen" \
+            -DLLVM_MIN_TABLEGEN="$GITHUB_WORKSPACE/build-host/bin/llvm-min-tblgen" \
+            -DCLANG_TABLEGEN="$GITHUB_WORKSPACE/build-host/bin/clang-tblgen"
 
       - name: Build
         run: |
