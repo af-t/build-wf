@@ -53,8 +53,7 @@ jobs:
             -DLLVM_HOST_TRIPLE=aarch64-linux-gnu \
             -DLLVM_ENABLE_LTO=Thin \
             -DLLVM_ENABLE_STACK_PROTECTOR=ON \
-            -DLLVM_ENABLE_DEAD_CODE_STRIPPING=ON \
-            -DLLVM_ENABLE_LLD=ON
+            -DLLVM_ENABLE_DEAD_CODE_STRIPPING=ON
 
       - name: Build
         run: |
