@@ -41,7 +41,7 @@ jobs:
             -DLLVM_BUILD_TOOLS=ON \
             -DLLVM_BUILD_UTILS=ON \
             -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF
-          cmake --build build-host --target llvm-tblgen llvm-min-tblgen --parallel "$(nproc)"
+          cmake --build build-host --target llvm-tblgen llvm-min-tblgen clang-tblgen --parallel "$(nproc)"
 
       - name: Configure cross-compile (arm64)
         run: |
