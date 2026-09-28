@@ -1,0 +1,78 @@
+name: Build LLVM 23 (cross-compile to arm64)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout LLVM
+        uses: actions/checkout@v7
+        with:
+          repository: llvm/llvm-project
+          ref: llvmorg-23.0.0
+          fetch-depth: 1
+
+      - name: Install cross-compilation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            python3 \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            libstdc++-12-dev-arm64-cross
+
+      - name: Configure (cross-compile to aarch64)
+        run: |
+          cmake -G Ninja \
+            -S llvm \
+            -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_SYSROOT=/usr/aarch64-linux-gnu \
+            -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-linux-gnu \
+            -DLLVM_HOST_TRIPLE=aarch64-linux-gnu \
+            -DLLVM_ENABLE_LTO=Thin \
+            -DLLVM_ENABLE_STACK_PROTECTOR=ON \
+            -DLLVM_ENABLE_DEAD_CODE_STRIPPING=ON \
+            -DLLVM_ENABLE_LLD=ON
+
+      - name: Build
+        run: |
+          cmake --build build \
+            --parallel "$(nproc)"
+
+      - name: Install
+        run: |
+          cmake --build build --target install
+
+      - name: Verify arm64 binaries
+        run: |
+          file install/bin/clang
+          file install/bin/ld.lld
+          install/bin/clang --version
+          install/bin/ld.lld --version
+
+      - name: Package
+        run: |
+          tar -C install \
+            -cJf "$GITHUB_WORKSPACE/clang-llvm-23-aarch64.tar.xz" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: clang-llvm-23-aarch64
+          path: clang-llvm-23-aarch64.tar.xz
