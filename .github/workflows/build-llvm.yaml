@@ -27,7 +27,13 @@ jobs:
             g++-aarch64-linux-gnu \
             libc6-dev-arm64-cross \
             libstdc++-13-dev-arm64-cross \
-            linux-libc-dev-arm64-cross
+            linux-libc-dev-arm64-cross \
+            qemu-user-static
+          # Allow executing freshly built aarch64 binaries on the x86_64
+          # runner. Required to build compiler-rt with the just-built
+          # clang and to verify the resulting toolchain.
+          sudo update-binfmts --enable || true
+          qemu-aarch64-static --version
 
       - name: Build host tools (native x86_64)
         run: |
@@ -67,6 +73,10 @@ jobs:
             -DCLANG_TABLEGEN="$GITHUB_WORKSPACE/build-host/bin/clang-tblgen"
 
       - name: Build
+        env:
+          # Sysroot for running aarch64 binaries under qemu/binfmt
+          # during the compiler-rt (builtins) configure step.
+          QEMU_LD_PREFIX: /usr/aarch64-linux-gnu
         run: |
           cmake --build build \
             --parallel "$(nproc)"
@@ -79,8 +89,11 @@ jobs:
         run: |
           file install/bin/clang
           file install/bin/ld.lld
-          install/bin/clang --version
-          install/bin/ld.lld --version
+          file install/bin/clang | grep -q -i aarch64
+          # Cross-compiled binaries can't run natively on x86_64,
+          # execute them explicitly via qemu with the arm64 sysroot.
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu install/bin/clang --version
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu install/bin/ld.lld --version
 
       - name: Package
         run: |
