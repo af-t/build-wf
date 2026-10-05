@@ -2,10 +2,59 @@ name: Build LLVM 23 (cross-compile to arm64)
 
 on:
   workflow_dispatch:
+    inputs:
+      host_compiler:
+        description: 'Host compiler (builds tablegen tools)'
+        type: choice
+        options: [clang-21, gcc]
+        default: clang-21
+      cross_compiler:
+        description: 'Cross compiler (builds arm64 toolchain)'
+        type: choice
+        options: [clang, gcc]
+        default: clang
+      lto:
+        description: 'LLVM_ENABLE_LTO (needs cross=clang)'
+        type: choice
+        options: [Thin, Full, OFF]
+        default: Thin
+      build_type:
+        description: 'CMAKE_BUILD_TYPE'
+        type: choice
+        options: [Release, MinSizeRel, RelWithDebInfo]
+        default: Release
+      targets:
+        description: 'LLVM_TARGETS_TO_BUILD'
+        default: 'AArch64;ARM'
+      projects:
+        description: 'LLVM_ENABLE_PROJECTS (must include clang)'
+        default: 'clang;lld'
+      enable_runtimes:
+        description: 'Build compiler-rt runtimes (broken for cross: triple mismatch)'
+        type: boolean
+        default: false
+      toolchain_only:
+        description: 'Install toolchain only'
+        type: boolean
+        default: true
+      free_disk_space:
+        description: 'Remove unused preinstalled software to free disk'
+        type: boolean
+        default: true
+      assertions:
+        description: 'Enable LLVM assertions'
+        type: boolean
+        default: false
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
+
+    env:
+      CCACHE_MAXSIZE: 5G
+      CCACHE_COMPRESS: "true"
+      CCACHE_SLOPPINESS: pch_defines,time_macros
+      CCACHE_BASEDIR: ${{ github.workspace }}
 
     steps:
       - name: Checkout LLVM
@@ -15,34 +64,122 @@ jobs:
           ref: llvmorg-23.1.2
           fetch-depth: 1
 
+      - name: Validate options
+        run: |
+          if [ "${{ inputs.cross_compiler }}" = "gcc" ] && [ "${{ inputs.lto }}" != "OFF" ]; then
+            echo "::error::LTO needs cross_compiler=clang (GCC cross rejects -flto=thin/full)"
+            exit 1
+          fi
+          case ";${{ inputs.projects }};" in
+            *";clang;"*) ;;
+            *)
+              echo "::error::projects must include clang (needed for clang-tblgen)"
+              exit 1
+              ;;
+          esac
+
       - name: Install cross-compilation dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            cmake \
-            ninja-build \
-            python3 \
-            build-essential \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
-            libstdc++-13-dev-arm64-cross \
+          # NOTE: clang-21 is preinstalled on the ubuntu-26.04 image,
+          # so it is intentionally not in the apt list below.
+          PKGS="cmake ninja-build python3 build-essential \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross libstdc++-15-dev-arm64-cross \
             linux-libc-dev-arm64-cross \
-            qemu-user-static
+            qemu-user qemu-user-binfmt ccache"
+          # shellcheck disable=SC2086
+          sudo apt-get install -y $PKGS
           # Allow executing freshly built aarch64 binaries on the x86_64
           # runner. Required to build compiler-rt with the just-built
           # clang and to verify the resulting toolchain.
-          sudo update-binfmts --enable || true
-          qemu-aarch64-static --version
+          sudo systemctl restart systemd-binfmt || true
+          ls /proc/sys/fs/binfmt_misc/qemu-aarch64 || true
+          qemu-aarch64 --version
+          ccache --version
+          command -v clang-21 >/dev/null && clang-21 --version || true
+
+      - name: Free disk space
+        if: ${{ inputs.free_disk_space }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" /opt/android /usr/local/lib/android 2>/dev/null || true
+          df -h
+
+      - name: Add swap for LTO linking
+        if: ${{ inputs.lto != 'OFF' }}
+        run: |
+          SWAP_GB=$(free -g | awk '/^Swap:/ {print $2}')
+          if [ "${SWAP_GB:-0}" -ge 16 ]; then
+            echo "swap ${SWAP_GB}G already enough, reusing"
+          else
+            # Prefer /mnt (Azure temp disk) when it is a real disk;
+            # fall back to RUNNER_TEMP if /mnt is tmpfs or missing.
+            if [ -d /mnt ] && [ "$(stat -f -c %T /mnt)" != "tmpfs" ]; then
+              SWAPDIR=/mnt
+            else
+              SWAPDIR="$RUNNER_TEMP"
+            fi
+            echo "adding 16G swapfile at $SWAPDIR/swapfile (current total ${SWAP_GB:-0}G)"
+            sudo rm -f "$SWAPDIR/swapfile"
+            sudo fallocate -l 16G "$SWAPDIR/swapfile" || sudo dd if=/dev/zero of="$SWAPDIR/swapfile" bs=1G count=16
+            sudo chmod 600 "$SWAPDIR/swapfile"
+            sudo mkswap "$SWAPDIR/swapfile"
+            sudo swapon "$SWAPDIR/swapfile"
+          fi
+          free -h
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-llvm-23-aarch64-u26.04-${{ inputs.cross_compiler }}-${{ inputs.lto }}-${{ github.sha }}
+          restore-keys: |
+            ccache-llvm-23-aarch64-u26.04-${{ inputs.cross_compiler }}-${{ inputs.lto }}-
+
+      - name: Configure ccache directory
+        run: echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+
+      - name: Reset ccache stats
+        run: |
+          ccache --zero-stats
+          ccache --print-config | grep -iE 'cache_dir|max_size' || true
+
+      - name: Create clang cross wrapper
+        if: ${{ inputs.cross_compiler == 'clang' }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/clang-cross"
+          cat > "$GITHUB_WORKSPACE/clang-cross/aarch64-clang" <<'EOF'
+          #!/bin/sh
+          # NOTE: no --sysroot here. Ubuntu clang already knows the
+          # Debian cross layout; adding --sysroot double-prefixes paths
+          # (ld looks for <sysroot>/usr/aarch64-linux-gnu/...).
+          # Clang driver mode follows argv[0]: invoked as *++* it links
+          # libstdc++, otherwise it links as C. Keep both entry points.
+          case "$(basename "$0")" in
+            *++*) exec clang++-21 --target=aarch64-linux-gnu "$@" ;;
+            *) exec clang-21 --target=aarch64-linux-gnu "$@" ;;
+          esac
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/clang-cross/aarch64-clang"
+          ln -sf aarch64-clang "$GITHUB_WORKSPACE/clang-cross/aarch64-clang++"
 
       - name: Build host tools (native x86_64)
         run: |
+          HOST_FLAGS=""
+          if [ "${{ inputs.host_compiler }}" = "clang-21" ]; then
+            HOST_FLAGS="-DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21"
+          fi
+          # shellcheck disable=SC2086
           cmake -G Ninja \
             -S llvm \
             -B build-host \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_ENABLE_PROJECTS="clang;lld" \
-            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM" \
+            $HOST_FLAGS \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLVM_ENABLE_PROJECTS="${{ inputs.projects }}" \
+            -DLLVM_TARGETS_TO_BUILD="${{ inputs.targets }}" \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_BUILD_TOOLS=ON \
             -DLLVM_BUILD_UTILS=ON \
@@ -51,26 +188,59 @@ jobs:
 
       - name: Configure cross-compile (arm64)
         run: |
+          if [ "${{ inputs.cross_compiler }}" = "clang" ]; then
+            CROSS_C="$GITHUB_WORKSPACE/clang-cross/aarch64-clang"
+            CROSS_CXX="$GITHUB_WORKSPACE/clang-cross/aarch64-clang++"
+          else
+            CROSS_C="aarch64-linux-gnu-gcc"
+            CROSS_CXX="aarch64-linux-gnu-g++"
+          fi
+          RUNTIMES_FLAG=""
+          if [ "${{ inputs.enable_runtimes }}" = "true" ]; then
+            RUNTIMES_FLAG="-DLLVM_ENABLE_RUNTIMES=compiler-rt"
+          fi
+          if [ "${{ inputs.toolchain_only }}" = "true" ]; then
+            TOOLCHAIN_FLAG="-DLLVM_INSTALL_TOOLCHAIN_ONLY=ON"
+          else
+            TOOLCHAIN_FLAG="-DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF"
+          fi
+          if [ "${{ inputs.assertions }}" = "true" ]; then
+            ASSERTIONS_FLAG="-DLLVM_ENABLE_ASSERTIONS=ON"
+          else
+            ASSERTIONS_FLAG="-DLLVM_ENABLE_ASSERTIONS=OFF"
+          fi
+          # shellcheck disable=SC2086
           cmake -G Ninja \
             -S llvm \
             -B build \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE="${{ inputs.build_type }}" \
             -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
-            -DLLVM_ENABLE_PROJECTS="clang;lld" \
-            -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
-            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM" \
-            -DLLVM_ENABLE_ASSERTIONS=OFF \
-            -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
-            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_C_COMPILER="$CROSS_C" \
+            -DCMAKE_CXX_COMPILER="$CROSS_CXX" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLVM_ENABLE_PROJECTS="${{ inputs.projects }}" \
+            $RUNTIMES_FLAG \
+            -DLLVM_TARGETS_TO_BUILD="${{ inputs.targets }}" \
+            $ASSERTIONS_FLAG \
+            $TOOLCHAIN_FLAG \
             -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-linux-gnu \
             -DLLVM_HOST_TRIPLE=aarch64-linux-gnu \
-            -DLLVM_ENABLE_LTO=OFF \
+            -DLLVM_ENABLE_LTO="${{ inputs.lto }}" \
             -DLLVM_ENABLE_STACK_PROTECTOR=ON \
             -DLLVM_ENABLE_DEAD_CODE_STRIPPING=ON \
             -DLLVM_TABLEGEN="$GITHUB_WORKSPACE/build-host/bin/llvm-tblgen" \
             -DLLVM_MIN_TABLEGEN="$GITHUB_WORKSPACE/build-host/bin/llvm-min-tblgen" \
             -DCLANG_TABLEGEN="$GITHUB_WORKSPACE/build-host/bin/clang-tblgen"
+
+      - name: Show selected toolchains
+        run: |
+          echo "--- wrapper ---"
+          cat "$GITHUB_WORKSPACE/clang-cross/aarch64-clang" 2>/dev/null || echo "(no wrapper: gcc cross selected)"
+          echo "--- cross compilers (build/CMakeCache.txt) ---"
+          grep -E '^CMAKE_(C|CXX)_COMPILER' build/CMakeCache.txt || true
+          echo "--- host compilers (build-host/CMakeCache.txt) ---"
+          grep -E '^CMAKE_(C|CXX)_COMPILER' build-host/CMakeCache.txt || true
 
       - name: Build
         env:
@@ -92,8 +262,8 @@ jobs:
           file install/bin/clang | grep -q -i aarch64
           # Cross-compiled binaries can't run natively on x86_64,
           # execute them explicitly via qemu with the arm64 sysroot.
-          qemu-aarch64-static -L /usr/aarch64-linux-gnu install/bin/clang --version
-          qemu-aarch64-static -L /usr/aarch64-linux-gnu install/bin/ld.lld --version
+          qemu-aarch64 -L /usr/aarch64-linux-gnu install/bin/clang --version
+          qemu-aarch64 -L /usr/aarch64-linux-gnu install/bin/ld.lld --version
 
       - name: Package
         run: |
@@ -105,3 +275,7 @@ jobs:
         with:
           name: clang-llvm-23-aarch64
           path: clang-llvm-23-aarch64.tar.xz
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache --show-stats || true
